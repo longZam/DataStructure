@@ -43,194 +43,147 @@ public readonly struct Bounds(Vector3 center, Vector3 size)
     }
 }
 
-public sealed class BVH<T> where T : struct
+public sealed class BVH<T> where T : notnull
 {
+
     private struct Node
     {
-        public enum Type
-        {
-            None,
-            Leaf,
-            Interior
-        }
-
         public Bounds bounds;
         public T item;
-        public Type type;
-        public int height;
+        public int parent, left, right;
     }
 
-    private readonly Dictionary<T, int> leafNodes;
-    private Node[] nodes;
+
+    private readonly Dictionary<T, int> leafNodeIndexMap;
+    private Node[] nodeArray;
+    private int count;
+    private int root;
 
     public int Capacity { get; private set; }
-    public int Count { get; private set; }
 
 
     public BVH(int capacity)
     {
-        this.leafNodes = new Dictionary<T, int>(capacity);
-        this.nodes = new Node[capacity];
+        this.leafNodeIndexMap = new Dictionary<T, int>(capacity);
+        this.nodeArray = new Node[capacity];
         this.Capacity = capacity;
-        this.Count = 0;
+        this.count = 0;
+        this.root = -1;
     }
 
-    public void Insert(T item, Bounds bounds)
+    public void Traversal(Func<Bounds, bool> predicate, Action<T> callback)
     {
-        Debug.Assert(!leafNodes.ContainsKey(item));
-        Count += 1;
-        leafNodes.Add(item, 0);
+        if (root == -1)
+            return;
+        
+        Traversal(predicate, callback, root);
+    }
 
-        if (nodes[0].type == Node.Type.None)
+    private void Traversal(Func<Bounds, bool> predicate, Action<T> callback, int current)
+    {   
+        if (!predicate(nodeArray[current].bounds))
         {
-            nodes[0] = new Node
-            {
-                bounds = bounds,
-                item = item,
-                type = Node.Type.Leaf
-            };
-            leafNodes[item] = 0;
             return;
         }
 
-        var current = 0;
-
-        while (nodes[current].type == Node.Type.Interior)
+        if (nodeArray[current].left != -1 && nodeArray[current].right != -1)
         {
-            // 표면적 휴리스틱
-            var lb = Bounds.Union(bounds, nodes[current * 2 + 1].bounds).SurfaceArea() * nodes[current * 2 + 1].height * 5;
-            var rb = Bounds.Union(bounds, nodes[current * 2 + 2].bounds).SurfaceArea() * nodes[current * 2 + 2].height * 5;
-
-            current = (current * 2) + (lb < rb ? 1 : 2);
-        }
-
-        if (Capacity <= current * 2 + 2)
-        {
-            Capacity *= 2;
-            Array.Resize(ref nodes, Capacity);
-        }
-
-        nodes[current * 2 + 1] = nodes[current];
-        nodes[current * 2 + 2] = new Node
-        {
-            bounds = bounds,
-            item = item,
-            type = Node.Type.Leaf
-        };
-        nodes[current].type = Node.Type.Interior;
-        Refit(current);
-
-        leafNodes[nodes[current * 2 + 1].item] = current * 2 + 1;
-        leafNodes[item] = current * 2 + 2;
-    }
-
-    public bool Remove(T item)
-    {
-        if (!leafNodes.Remove(item, out var index))
-            return false;
-
-        nodes[index].type = Node.Type.None;
-
-        if (index != 0)
-            RebuildSubtree((index - 1) / 2);
-
-        return true;
-    }
-
-    private readonly System.Collections.Generic.Queue<Node> rebuildQueue = new System.Collections.Generic.Queue<Node>(8192);
-    private readonly System.Collections.Generic.Stack<int> rebuildStack = new System.Collections.Generic.Stack<int>(8192);
-
-    private void RebuildSubtree(int subtree)
-    {
-        // 서브 트리 내 모든 leaf 노드 수집
-        GetLeafsFromSubtree(subtree);
-
-        // 서브 트리 루트만 남기고 모두 제거
-        RemoveSubtree(subtree);
-
-        while (rebuildQueue.TryDequeue(out var node))
-        {
-            var current = subtree;
-
-            if (nodes[current].type == Node.Type.None)
-            {
-                nodes[current] = node;
-                leafNodes[node.item] = current;
-                continue;
-            }
-
-            while (nodes[current].type == Node.Type.Interior)
-            {
-                // 표면적 휴리스틱
-                var lb = Bounds.Union(node.bounds, nodes[current * 2 + 1].bounds).SurfaceArea() * nodes[current * 2 + 1].height * 5;
-                var rb = Bounds.Union(node.bounds, nodes[current * 2 + 2].bounds).SurfaceArea() * nodes[current * 2 + 2].height * 5;
-
-                current = (current * 2) + (lb < rb ? 1 : 2);
-            }
-
-            nodes[current * 2 + 1] = nodes[current];
-            nodes[current * 2 + 2] = node;
-            nodes[current].type = Node.Type.Interior;
-            Refit(current);
-
-            leafNodes[nodes[current * 2 + 1].item] = current * 2 + 1;
-            leafNodes[node.item] = current * 2 + 2;
-        }
-    }
-
-    private void GetLeafsFromSubtree(int subtree)
-    {
-        if (nodes[subtree].type == Node.Type.Interior)
-        {
-            GetLeafsFromSubtree(subtree * 2 + 1);
-            GetLeafsFromSubtree(subtree * 2 + 2);
-        }
-        else if (nodes[subtree].type == Node.Type.Leaf)
-        {
-            rebuildQueue.Enqueue(nodes[subtree]);
-        }
-    }
-
-    private void RemoveSubtree(int subtree)
-    {
-        if (nodes[subtree].type == Node.Type.Interior)
-        {
-            RemoveSubtree(subtree * 2 + 1);
-            RemoveSubtree(subtree * 2 + 2);
-        }
-
-        nodes[subtree].type = Node.Type.None;
-        nodes[subtree].height = 0;
-    }
-
-    public void Traversal(Func<Bounds, bool> predicate, Action<T> callback, int current = 0)
-    {
-        if (nodes[current].type == Node.Type.None)
-            return;
-
-        if (!predicate(nodes[current].bounds))
-            return;
-
-        if (nodes[current].type == Node.Type.Interior)
-        {
-            Traversal(predicate, callback, current * 2 + 1);
-            Traversal(predicate, callback, current * 2 + 2);
+            Traversal(predicate, callback, nodeArray[current].left);
+            Traversal(predicate, callback, nodeArray[current].right);
         }
         else
         {
-            callback(nodes[current].item);
+            callback(nodeArray[current].item);
         }
+    }
+
+    public bool Insert(T item, Bounds bounds)
+    {
+        if (leafNodeIndexMap.ContainsKey(item))
+            return false;
+
+        var newLeafNode = CreateNode();
+        nodeArray[newLeafNode].item = item;
+        leafNodeIndexMap.Add(item, newLeafNode);
+        nodeArray[newLeafNode].bounds = bounds;
+        
+        // insert root
+        if (newLeafNode == 0)
+        {
+            root = 0;
+            return true;
+        }
+        
+        int current = root;
+
+        while (current < count)
+        {
+            // 해당 노드가 leaf 노드면
+            if (nodeArray[current].left == -1 && nodeArray[current].right == -1)
+                break;
+            
+            // 해당 노드가 interior 노드면
+            var lb = Bounds.Union(bounds, nodeArray[nodeArray[current].left].bounds).SurfaceArea();
+            var rb = Bounds.Union(bounds, nodeArray[nodeArray[current].right].bounds).SurfaceArea();
+
+            current = lb < rb ? nodeArray[current].left : nodeArray[current].right;
+        }
+
+        // 해당 leaf 노드와 새로운 interior 노드를 구성해야 함.
+        
+        var newInteriorNode = CreateNode(current,
+                                         newLeafNode,
+                                         false);
+                
+        var parent = nodeArray[current].parent;
+        nodeArray[newInteriorNode].parent = parent;
+        nodeArray[current].parent = newInteriorNode;
+        nodeArray[newLeafNode].parent = newInteriorNode;
+
+        if (parent == -1)
+            root = newInteriorNode;
+        else if (nodeArray[parent].left == current)
+            nodeArray[parent].left = newInteriorNode;
+        else
+            nodeArray[parent].right = newInteriorNode;
+
+        Refit(newInteriorNode);
+        
+        return true;
+    }
+
+    private int CreateNode(int left = -1, int right = -1, bool leaf = true)
+    {
+        if (Capacity <= count)
+        {
+            Capacity *= 2;
+            Array.Resize(ref nodeArray, Capacity);
+        }
+
+        nodeArray[count] = new()
+        {
+            parent = -1,
+            left = left,
+            right = right
+        };
+
+        return count++;
     }
 
     private void Refit(int current)
     {
-        current = current * 2 + 1;
-
-        while (current != 0)
+        while (current != -1)
         {
-            current = (current - 1) / 2;
-            nodes[current].bounds = Bounds.Union(nodes[current * 2 + 1].bounds, nodes[current * 2 + 2].bounds);
-            nodes[current].height = Math.Max(nodes[current * 2 + 1].height, nodes[current * 2 + 2].height) + 1;
+            var currNode = nodeArray[current];
+            var left = nodeArray[currNode.left].bounds;
+            var right = nodeArray[currNode.right].bounds;
+            var union = Bounds.Union(left, right);
+
+            if (currNode.bounds.Contains(union))
+                break;
+
+            nodeArray[current].bounds = union;
+            current = nodeArray[current].parent;
         }
     }
 }
