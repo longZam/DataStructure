@@ -51,12 +51,16 @@ public sealed class BVH<T> where T : notnull
         public Bounds bounds;
         public T item;
         public int parent, left, right;
+        public bool isLeaf;
     }
 
 
-    private readonly Dictionary<T, int> leafNodeIndexMap;
-    private Node[] nodeArray;
-    private int count;
+    private const int NULL = -1;
+
+    private readonly Dictionary<T, int> leafNodeMap;
+    private readonly System.Collections.Generic.Queue<int> freeMemoryOffsets;
+
+    private Node[] nodes;
     private int root;
 
     public int Capacity { get; private set; }
@@ -64,11 +68,11 @@ public sealed class BVH<T> where T : notnull
 
     public BVH(int capacity)
     {
-        this.leafNodeIndexMap = new Dictionary<T, int>(capacity);
-        this.nodeArray = new Node[capacity];
+        this.leafNodeMap = new Dictionary<T, int>(capacity);
+        this.freeMemoryOffsets = new(Enumerable.Range(0, capacity));
+        this.nodes = new Node[capacity];
         this.Capacity = capacity;
-        this.count = 0;
-        this.root = -1;
+        this.root = NULL;
     }
 
     public void Traversal(Func<Bounds, bool> predicate, Action<T> callback)
@@ -79,111 +83,222 @@ public sealed class BVH<T> where T : notnull
         Traversal(predicate, callback, root);
     }
 
+    public int cnt = 0;
+
     private void Traversal(Func<Bounds, bool> predicate, Action<T> callback, int current)
     {   
-        if (!predicate(nodeArray[current].bounds))
+        cnt += 1;
+        if (!predicate(nodes[current].bounds))
         {
             return;
         }
 
-        if (nodeArray[current].left != -1 && nodeArray[current].right != -1)
+        if (nodes[current].left != -1 && nodes[current].right != -1)
         {
-            Traversal(predicate, callback, nodeArray[current].left);
-            Traversal(predicate, callback, nodeArray[current].right);
+            Traversal(predicate, callback, nodes[current].left);
+            Traversal(predicate, callback, nodes[current].right);
         }
         else
         {
-            callback(nodeArray[current].item);
+            callback(nodes[current].item);
         }
+    }
+
+    public void BottomUp()
+    {
+        var queue = new System.Collections.Generic.Queue<int>(Capacity / 2);
+        // 1. 모든 interior 노드 제거
+        
+        foreach (var leaf in leafNodeMap.Values)
+            RemoveInteriors(nodes[leaf].parent);
+
+        // Z-Order 정렬해서 큐에 삽입
+        var zOrder = leafNodeMap.Values.OrderBy(i => Morton3D.Encode(nodes[i].bounds.Center));
+
+        foreach (var leaf in zOrder)
+            queue.Enqueue(leaf);
+
+        while (queue.Count > 1)
+        {
+            var left = queue.Dequeue();
+            var right = queue.Dequeue();
+            var interior = Allocate();
+
+            nodes[interior] = new()
+            {
+                bounds = Bounds.Union(nodes[left].bounds, nodes[right].bounds),
+                left = left,
+                right = right,
+                isLeaf = false,
+                parent = NULL
+            };
+
+            nodes[left].parent = interior;
+            nodes[right].parent = interior;
+
+            queue.Enqueue(interior);
+        }
+
+        root = queue.Dequeue();
+    }
+
+    private void RemoveInteriors(int parent)
+    {
+        if (parent == NULL)
+            return;
+        
+        nodes[nodes[parent].left].parent = NULL;
+        nodes[nodes[parent].right].parent = NULL;
+        RemoveInteriors(nodes[parent].parent);
+        Free(parent);
     }
 
     public bool Insert(T item, Bounds bounds)
     {
-        if (leafNodeIndexMap.ContainsKey(item))
+        if (leafNodeMap.ContainsKey(item))
             return false;
-
-        var newLeafNode = CreateNode();
-        nodeArray[newLeafNode].item = item;
-        leafNodeIndexMap.Add(item, newLeafNode);
-        nodeArray[newLeafNode].bounds = bounds;
         
-        // insert root
-        if (newLeafNode == 0)
+        var leaf = Allocate();
+        nodes[leaf] = new()
         {
-            root = 0;
+            bounds = bounds,
+            isLeaf = true,
+            item = item,
+            left = NULL,
+            parent = NULL,
+            right = NULL,
+        };
+
+        leafNodeMap.Add(item, leaf);
+        
+        var slibing = PickBest(bounds);
+
+        if (slibing == NULL)
+        {
+            root = leaf;
             return true;
         }
-        
-        int current = root;
 
-        while (current < count)
+        var newInterior = Allocate();
+
+        nodes[newInterior] = new()
         {
-            // 해당 노드가 leaf 노드면
-            if (nodeArray[current].left == -1 && nodeArray[current].right == -1)
-                break;
-            
-            // 해당 노드가 interior 노드면
-            var lb = Bounds.Union(bounds, nodeArray[nodeArray[current].left].bounds).SurfaceArea();
-            var rb = Bounds.Union(bounds, nodeArray[nodeArray[current].right].bounds).SurfaceArea();
+            left = slibing,
+            right = leaf,
+            parent = nodes[slibing].parent,
+            isLeaf = false
+        };
 
-            current = lb < rb ? nodeArray[current].left : nodeArray[current].right;
-        }
-
-        // 해당 leaf 노드와 새로운 interior 노드를 구성해야 함.
+        nodes[leaf].parent = newInterior;
+        nodes[slibing].parent = newInterior;
         
-        var newInteriorNode = CreateNode(current,
-                                         newLeafNode,
-                                         false);
-                
-        var parent = nodeArray[current].parent;
-        nodeArray[newInteriorNode].parent = parent;
-        nodeArray[current].parent = newInteriorNode;
-        nodeArray[newLeafNode].parent = newInteriorNode;
+        var ancestor = nodes[newInterior].parent;
 
-        if (parent == -1)
-            root = newInteriorNode;
-        else if (nodeArray[parent].left == current)
-            nodeArray[parent].left = newInteriorNode;
+        if (ancestor == NULL)
+            root = newInterior;
+        else if (nodes[ancestor].left == slibing)
+            nodes[ancestor].left = newInterior;
         else
-            nodeArray[parent].right = newInteriorNode;
+            nodes[ancestor].right = newInterior;
 
-        Refit(newInteriorNode);
-        
+        Refit(newInterior);
+
         return true;
     }
 
-    private int CreateNode(int left = -1, int right = -1, bool leaf = true)
+    public bool Remove(T item)
     {
-        if (Capacity <= count)
+        if (!leafNodeMap.Remove(item, out var leaf))
+            return false;
+        
+        var parent = nodes[leaf].parent;
+
+        if (parent == NULL)
         {
-            Capacity *= 2;
-            Array.Resize(ref nodeArray, Capacity);
+            root = NULL;
+        }
+        else
+        {
+            // 형제 노드와 부모의 부모 간 연결
+            // 부모의 부모가 NULL이면, 루트가 되어야 한다는 뜻
+            var ancestor = nodes[parent].parent;
+            var slibing = nodes[parent].left == leaf ? nodes[parent].right : nodes[parent].left;
+            nodes[slibing].parent = ancestor;
+            
+            if (ancestor == NULL)
+                root = slibing;
+            else if (nodes[ancestor].left == parent)
+                nodes[ancestor].left = slibing;
+            else
+                nodes[ancestor].right = slibing;
+
+            Free(parent);
         }
 
-        nodeArray[count] = new()
-        {
-            parent = -1,
-            left = left,
-            right = right
-        };
+        Free(leaf);
+        return true;
+    }
 
-        return count++;
+    private int PickBest(Bounds bounds)
+    {
+        if (root == NULL)
+            return NULL;
+        
+        var current = root;
+
+        while (!nodes[current].isLeaf)
+        {
+            var left = nodes[current].left;
+            var right = nodes[current].right;
+
+            var lu = Bounds.Union(bounds, nodes[left].bounds).SurfaceArea();
+            var ru = Bounds.Union(bounds, nodes[right].bounds).SurfaceArea();
+
+            current = lu < ru ? left : right;
+        }
+
+        return current;
+    }
+
+    private int Allocate()
+    {
+        if (!freeMemoryOffsets.TryDequeue(out var offset))
+        {
+            offset = Capacity;
+
+            for (int i = Capacity + 1; i < Capacity * 2; ++i)
+                freeMemoryOffsets.Enqueue(i);
+            
+            Capacity *= 2;
+            Array.Resize(ref nodes, Capacity);
+        }
+
+        return offset;
+    }
+
+    private void Free(int offset)
+    {
+#if DEBUG
+        nodes[offset] = new();
+#endif
+
+        freeMemoryOffsets.Enqueue(offset);
     }
 
     private void Refit(int current)
     {
         while (current != -1)
         {
-            var currNode = nodeArray[current];
-            var left = nodeArray[currNode.left].bounds;
-            var right = nodeArray[currNode.right].bounds;
+            var currNode = nodes[current];
+            var left = nodes[currNode.left].bounds;
+            var right = nodes[currNode.right].bounds;
             var union = Bounds.Union(left, right);
 
             if (currNode.bounds.Contains(union))
                 break;
 
-            nodeArray[current].bounds = union;
-            current = nodeArray[current].parent;
+            nodes[current].bounds = union;
+            current = nodes[current].parent;
         }
     }
 }
